@@ -1,3 +1,6 @@
-requests>=2.32.0
-pandas>=2.2.0
-numpy>=1.26.0
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+site/
