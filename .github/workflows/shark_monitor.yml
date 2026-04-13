@@ -11,6 +11,7 @@ permissions:
 jobs:
   run-shark:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,8 +21,27 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate requirements.txt encoding
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("requirements.txt")
+          raw = p.read_bytes()
+          print("requirements.txt bytes:", raw[:80])
+          try:
+              text = raw.decode("utf-8")
+              print("requirements.txt decoded successfully as UTF-8")
+              print(text)
+          except UnicodeDecodeError as e:
+              raise SystemExit(
+                  f"requirements.txt is not valid UTF-8: {e}. "
+                  "Replace the file in the repository with a plain UTF-8 text file."
+              )
+          PY
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
       - name: Run pipeline
         env:
@@ -32,9 +52,11 @@ jobs:
         run: python run_pipeline.py
 
       - name: Commit generated dashboard data
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/api docs/index.html state/alerts_state.json
-          git diff --cached --quiet || git commit -m "chore: update shark dashboard data"
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update shark dashboard data"
           git push
