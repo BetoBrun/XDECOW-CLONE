@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+import numpy as np
+import pandas as pd
+
+
+PHI_PERIODS = [8, 13, 21, 34, 55, 89]
+
+
+def calc_lsr_surge(df_lsr: pd.DataFrame, threshold: float = 0.05) -> pd.DataFrame:
+    df = df_lsr.copy()
+    if df.empty:
+        return df
+    df["lsr_pct_change"] = df["longShortRatio"].pct_change()
+    df["surge_up"] = df["lsr_pct_change"] > threshold
+    df["surge_down"] = df["lsr_pct_change"] < -threshold
+    df["surge"] = df["surge_up"] | df["surge_down"]
+    return df
+
+
+def calc_taker_aggression(df_taker: pd.DataFrame) -> pd.DataFrame:
+    df = df_taker.copy()
+    if df.empty:
+        return df
+    base = (df["buyVol"] + df["sellVol"]).replace(0, np.nan)
+    df["aggression"] = df["buyVol"] / base
+    df["aggression_ma"] = df["aggression"].rolling(5).mean()
+    return df
+
+
+def calc_taker_dominance(df_taker: pd.DataFrame) -> pd.DataFrame:
+    df = df_taker.copy()
+    if df.empty:
+        return df
+    base = (df["buyVol"] + df["sellVol"]).replace(0, np.nan)
+    df["dominance_pct"] = df["buyVol"] / base * 100
+    return df
+
+
+def calc_cvd_from_trades(df_trades: pd.DataFrame) -> pd.DataFrame:
+    df = df_trades.copy()
+    if df.empty:
+        return df
+    df["delta"] = np.where(df["side"] == "buy", df["value"], -df["value"])
+    df["cvd"] = df["delta"].cumsum()
+    return df
+
+
+def calc_cvd_from_klines(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if "taker_buy_base" not in out.columns:
+        out["taker_buy_base"] = out["volume"] * 0.5
+    out["taker_sell"] = out["volume"] - out["taker_buy_base"]
+    out["delta"] = out["taker_buy_base"] - out["taker_sell"]
+    out["cvd"] = out["delta"].cumsum()
+    return out
+
+
+def calc_avg_ticket_from_klines(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if "quote_volume" in out.columns:
+        out["avg_ticket"] = np.where(out["trades"] > 0, out["quote_volume"] / out["trades"], np.nan)
+    else:
+        out["avg_ticket"] = np.where(out["trades"] > 0, out["close"] * out["volume"] / out["trades"], np.nan)
+    return out
+
+
+def calc_avg_ticket_from_trades(df_trades: pd.DataFrame) -> float:
+    if df_trades.empty:
+        return float("nan")
+    total_value = df_trades["value"].sum()
+    n = max(len(df_trades), 1)
+    return float(total_value / n)
+
+
+def calc_activity(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    mu = out["trades"].rolling(window).mean()
+    sigma = out["trades"].rolling(window).std().replace(0, np.nan)
+    out["activity_zscore"] = (out["trades"] - mu) / sigma
+    return out
+
+
+def calc_sma_distance(df: pd.DataFrame, fast: int = 21, slow: int = 200) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    out[f"sma_{fast}"] = out["close"].rolling(fast).mean()
+    out[f"sma_{slow}"] = out["close"].rolling(slow).mean()
+    out[f"dist_sma{fast}"] = (out["close"] / out[f"sma_{fast}"] - 1.0) * 100
+    out[f"dist_sma{slow}"] = (out["close"] / out[f"sma_{slow}"] - 1.0) * 100
+    return out
+
+
+def calc_phi_trend(df: pd.DataFrame, periods: List[int] | None = None) -> pd.DataFrame:
+    periods = periods or PHI_PERIODS
+    out = df.copy()
+    if out.empty:
+        return out
+    for p in periods:
+        out[f"sma_{p}"] = out["close"].rolling(p).mean()
+    phi_score = []
+    phi_bullish = []
+    phi_bearish = []
+    for _, row in out.iterrows():
+        score = 0
+        valid = True
+        for left, right in zip(periods[:-1], periods[1:]):
+            a = row.get(f"sma_{left}")
+            b = row.get(f"sma_{right}")
+            if pd.isna(a) or pd.isna(b):
+                valid = False
+                break
+            if a > b:
+                score += 1
+        if not valid:
+            phi_score.append(np.nan)
+            phi_bullish.append(False)
+            phi_bearish.append(False)
+            continue
+        phi_score.append(score)
+        phi_bullish.append(score >= max(len(periods) - 2, 1))
+        phi_bearish.append(score <= 1)
+    out["phi_score"] = phi_score
+    out["phi_bullish"] = phi_bullish
+    out["phi_bearish"] = phi_bearish
+    return out
+
+
+def build_snapshot(
+    source: str,
+    symbol: str,
+    *,
+    klines: pd.DataFrame,
+    lsr: pd.DataFrame | None = None,
+    taker: pd.DataFrame | None = None,
+    trades: pd.DataFrame | None = None,
+    market: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    market = market or {}
+    klines = klines.copy()
+    lsr = pd.DataFrame() if lsr is None else lsr.copy()
+    taker = pd.DataFrame() if taker is None else taker.copy()
+    trades = pd.DataFrame() if trades is None else trades.copy()
+
+    if not klines.empty:
+        klines = calc_avg_ticket_from_klines(klines)
+        klines = calc_activity(klines)
+        klines = calc_sma_distance(klines)
+        klines = calc_phi_trend(klines)
+        klines = calc_cvd_from_klines(klines)
+        last_k = klines.iloc[-1]
+        prev_k = klines.iloc[-2] if len(klines) > 1 else klines.iloc[-1]
+    else:
+        last_k = {}
+        prev_k = {}
+
+    if not lsr.empty:
+        lsr = calc_lsr_surge(lsr)
+        last_l = lsr.iloc[-1]
+    else:
+        last_l = {}
+
+    if not taker.empty:
+        taker = calc_taker_aggression(taker)
+        taker = calc_taker_dominance(taker)
+        last_t = taker.iloc[-1]
+    else:
+        last_t = {}
+
+    if not trades.empty:
+        trades = calc_cvd_from_trades(trades)
+        avg_ticket_trades = calc_avg_ticket_from_trades(trades)
+        cvd_trades = float(trades["cvd"].iloc[-1])
+    else:
+        avg_ticket_trades = float("nan")
+        cvd_trades = float("nan")
+
+    def read(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        try:
+            value = obj[key]
+            if pd.isna(value):
+                return default
+            return value
+        except Exception:
+            return default
+
+    close = read(last_k, "close")
+    prev_close = read(prev_k, "close")
+    change_pct = None
+    if close not in (None, 0) and prev_close not in (None, 0):
+        try:
+            change_pct = (float(close) / float(prev_close) - 1.0) * 100
+        except Exception:
+            change_pct = None
+
+    snapshot = {
+        "source": source,
+        "symbol": symbol,
+        "timestamp": str(klines.index[-1].isoformat()) if not klines.empty else None,
+        "close": _to_num(close),
+        "change_pct": _to_num(change_pct),
+        "volume": _to_num(read(last_k, "volume")),
+        "trades": _to_num(read(last_k, "trades")),
+        "cvd": _to_num(read(last_k, "cvd", cvd_trades)),
+        "avg_ticket": _to_num(read(last_k, "avg_ticket", avg_ticket_trades)),
+        "activity_zscore": _to_num(read(last_k, "activity_zscore")),
+        "dist_sma21": _to_num(read(last_k, "dist_sma21")),
+        "dist_sma200": _to_num(read(last_k, "dist_sma200")),
+        "phi_score": _to_num(read(last_k, "phi_score")),
+        "phi_bullish": bool(read(last_k, "phi_bullish", False)),
+        "phi_bearish": bool(read(last_k, "phi_bearish", False)),
+        "lsr_ratio": _to_num(read(last_l, "longShortRatio")),
+        "lsr_pct_change": _to_num(read(last_l, "lsr_pct_change")),
+        "surge_up": bool(read(last_l, "surge_up", False)),
+        "surge_down": bool(read(last_l, "surge_down", False)),
+        "aggression": _to_num(read(last_t, "aggression")),
+        "dominance_pct": _to_num(read(last_t, "dominance_pct")),
+        "funding": _to_num(market.get("funding")),
+        "open_interest": _to_num(market.get("open_interest")),
+        "premium": _to_num(market.get("premium")),
+        "mark_price": _to_num(market.get("mark_price")),
+        "oracle_price": _to_num(market.get("oracle_price")),
+    }
+    return snapshot
+
+
+def build_history_payload(source: str, symbol: str, klines: pd.DataFrame) -> List[Dict[str, Any]]:
+    if klines.empty:
+        return []
+    enriched = calc_avg_ticket_from_klines(klines.copy())
+    enriched = calc_activity(enriched)
+    enriched = calc_sma_distance(enriched)
+    enriched = calc_phi_trend(enriched)
+    enriched = calc_cvd_from_klines(enriched)
+    enriched = enriched.tail(96)
+    rows: List[Dict[str, Any]] = []
+    for ts, row in enriched.iterrows():
+        rows.append(
+            {
+                "timestamp": ts.isoformat(),
+                "close": _to_num(row.get("close")),
+                "volume": _to_num(row.get("volume")),
+                "cvd": _to_num(row.get("cvd")),
+                "activity_zscore": _to_num(row.get("activity_zscore")),
+                "dist_sma21": _to_num(row.get("dist_sma21")),
+                "phi_score": _to_num(row.get("phi_score")),
+            }
+        )
+    return rows
+
+
+def _to_num(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating, float, int)):
+            return float(value)
+        return value
+    except Exception:
+        return value

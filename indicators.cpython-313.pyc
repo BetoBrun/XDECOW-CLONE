@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_dashboard_files(
+    docs_api_dir: Path,
+    *,
+    snapshots: List[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    triggered_now: List[Dict[str, Any]],
+    histories: Dict[str, List[Dict[str, Any]]],
+    pipeline_errors: List[str],
+) -> None:
+    generated_at = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "generated_at": generated_at,
+        "symbols": [{"source": s["source"], "symbol": s["symbol"]} for s in snapshots],
+        "errors": pipeline_errors,
+    }
+    write_json(docs_api_dir / "meta.json", meta)
+    write_json(docs_api_dir / "latest_summary.json", snapshots)
+    write_json(docs_api_dir / "alerts_latest.json", events)
+    write_json(docs_api_dir / "alerts_triggered_now.json", triggered_now)
+    for key, payload in histories.items():
+        write_json(docs_api_dir / f"{key}.json", payload)
+
+
+def build_static_dashboard_html(output_path: Path) -> None:
+    output_path.write_text(DASHBOARD_HTML, encoding="utf-8")
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Xdecow Shark Dashboard</title>
+  <style>
+    :root {
+      --bg: #06101f;
+      --bg2: #0d1d33;
+      --card: #102746;
+      --line: #1f3a60;
+      --text: #f5f7fb;
+      --muted: #9fb3cc;
+      --good: #43d17a;
+      --bad: #ff6961;
+      --accent: #7ce6a3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: Arial, Helvetica, sans-serif; background: linear-gradient(180deg, var(--bg), #050b15 70%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1260px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 34px; }
+    p.sub { margin: 0 0 24px; color: var(--muted); }
+    .topbar, .grid, .alerts, .charts { display: grid; gap: 16px; }
+    .topbar { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 20px; }
+    .grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .card {
+      background: rgba(16,39,70,.9); border: 1px solid rgba(124,230,163,.15); border-radius: 18px; padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.22);
+    }
+    .metric { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+    .chip {
+      display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 12px; background: rgba(124,230,163,.12); color: var(--accent);
+      border: 1px solid rgba(124,230,163,.25);
+    }
+    .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .symbol { font-size: 18px; font-weight: 700; }
+    .pos { color: var(--good); }
+    .neg { color: var(--bad); }
+    .muted { color: var(--muted); }
+    .alerts { grid-template-columns: 1fr; margin-top: 20px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,.06); text-align: left; }
+    th { color: var(--muted); font-weight: 600; }
+    .charts { grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); margin-top: 20px; }
+    canvas { background: rgba(6,16,31,.4); border-radius: 12px; padding: 8px; width:100%; height: 220px; }
+    .footer { margin-top: 20px; color: var(--muted); font-size: 13px; }
+    select {
+      background: #0d1d33; color: white; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Xdecow Shark Dashboard</h1>
+    <p class="sub">Scanner multiativo com alertas, histórico e exportação JSON para GitHub Pages.</p>
+
+    <div class="topbar">
+      <div class="card">
+        <div class="metric">Última atualização</div>
+        <div class="value" id="generatedAt">...</div>
+      </div>
+      <div class="card">
+        <div class="metric">Ativos monitorados</div>
+        <div class="value" id="assetCount">...</div>
+      </div>
+      <div class="card">
+        <div class="metric">Novos alertas</div>
+        <div class="value" id="triggerCount">...</div>
+      </div>
+      <div class="card">
+        <div class="metric">Falhas de coleta</div>
+        <div class="value" id="errorCount">...</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div class="row">
+        <div>
+          <div class="metric">Selecione o ativo para o gráfico</div>
+          <div class="muted" id="selectedMeta">Carregando...</div>
+        </div>
+        <select id="historySelect"></select>
+      </div>
+    </div>
+
+    <div class="grid" id="snapshotGrid"></div>
+
+    <div class="charts">
+      <div class="card">
+        <div class="row"><div class="symbol">Preço</div><span class="chip">Histórico recente</span></div>
+        <canvas id="priceChart"></canvas>
+      </div>
+      <div class="card">
+        <div class="row"><div class="symbol">CVD</div><span class="chip">Fluxo acumulado</span></div>
+        <canvas id="cvdChart"></canvas>
+      </div>
+    </div>
+
+    <div class="alerts">
+      <div class="card">
+        <div class="row"><div class="symbol">Alertas</div><span class="chip">Plano Shark</span></div>
+        <table>
+          <thead>
+            <tr><th>Status</th><th>Nome</th><th>Ativo</th><th>Métrica</th><th>Atual</th><th>Alvo</th></tr>
+          </thead>
+          <tbody id="alertsBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="footer">A página consome arquivos estáticos em <code>docs/api</code>. Ideal para GitHub Pages e automação recorrente.</div>
+  </div>
+
+  <script>
+    async function getJson(path) {
+      const r = await fetch(path + '?v=' + Date.now());
+      return await r.json();
+    }
+
+    function fmtNum(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return '—';
+      return Number(value).toLocaleString('pt-BR', { maximumFractionDigits: digits, minimumFractionDigits: digits });
+    }
+
+    function statusClass(v) {
+      if (v === null || v === undefined) return 'muted';
+      return Number(v) >= 0 ? 'pos' : 'neg';
+    }
+
+    function drawSimpleChart(canvasId, values, lineColor) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      canvas.width = width * devicePixelRatio;
+      canvas.height = height * devicePixelRatio;
+      ctx.scale(devicePixelRatio, devicePixelRatio);
+      ctx.clearRect(0, 0, width, height);
+      if (!values.length) return;
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const pad = 18;
+      const y = (v) => {
+        if (max === min) return height / 2;
+        return height - pad - ((v - min) / (max - min)) * (height - 2 * pad);
+      };
+      const x = (i) => pad + (i * (width - 2 * pad) / Math.max(values.length - 1, 1));
+      ctx.strokeStyle = 'rgba(255,255,255,.08)';
+      ctx.beginPath();
+      ctx.moveTo(pad, pad);
+      ctx.lineTo(pad, height - pad);
+      ctx.lineTo(width - pad, height - pad);
+      ctx.stroke();
+      ctx.strokeStyle = lineColor;
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      values.forEach((v, i) => {
+        const px = x(i);
+        const py = y(v);
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    }
+
+    async function main() {
+      const [meta, summary, alerts, triggered] = await Promise.all([
+        getJson('./api/meta.json'),
+        getJson('./api/latest_summary.json'),
+        getJson('./api/alerts_latest.json'),
+        getJson('./api/alerts_triggered_now.json')
+      ]);
+
+      document.getElementById('generatedAt').textContent = new Date(meta.generated_at).toLocaleString('pt-BR');
+      document.getElementById('assetCount').textContent = summary.length;
+      document.getElementById('triggerCount').textContent = triggered.length;
+      document.getElementById('errorCount').textContent = (meta.errors || []).length;
+
+      const grid = document.getElementById('snapshotGrid');
+      grid.innerHTML = '';
+      summary.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        const changeClass = statusClass(item.change_pct);
+        card.innerHTML = `
+          <div class="row">
+            <div class="symbol">${item.symbol}</div>
+            <span class="chip">${item.source}</span>
+          </div>
+          <div class="metric">Preço</div>
+          <div class="value">${fmtNum(item.close, 2)}</div>
+          <div class="${changeClass}">Δ candle: ${fmtNum(item.change_pct, 2)}%</div>
+          <div class="metric">dist SMA21: ${fmtNum(item.dist_sma21, 2)}% | phi: ${fmtNum(item.phi_score, 0)}</div>
+          <div class="metric">CVD: ${fmtNum(item.cvd, 0)} | Activity: ${fmtNum(item.activity_zscore, 2)}</div>
+          <div class="metric">Funding: ${fmtNum(item.funding, 6)} | OI: ${fmtNum(item.open_interest, 0)}</div>
+        `;
+        grid.appendChild(card);
+      });
+
+      const tbody = document.getElementById('alertsBody');
+      tbody.innerHTML = '';
+      alerts.forEach(a => {
+        const tr = document.createElement('tr');
+        const status = a.new_trigger ? 'NOVO' : (a.triggered ? 'ATIVO' : 'OK');
+        tr.innerHTML = `
+          <td>${status}</td>
+          <td>${a.rule_name}</td>
+          <td>${a.source} ${a.symbol}</td>
+          <td>${a.metric}</td>
+          <td>${fmtNum(a.current, 4)}</td>
+          <td>${a.operator} ${fmtNum(a.target, 4)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+      const select = document.getElementById('historySelect');
+      const symbolOptions = summary.map(s => ({ key: `history_${s.source}_${s.symbol}`, label: `${s.source} ${s.symbol}` }));
+      symbolOptions.forEach((opt, idx) => {
+        const el = document.createElement('option');
+        el.value = opt.key;
+        el.textContent = opt.label;
+        if (idx === 0) el.selected = true;
+        select.appendChild(el);
+      });
+
+      async function loadChart(key) {
+        const payload = await getJson(`./api/${key}.json`);
+        drawSimpleChart('priceChart', payload.map(x => Number(x.close || 0)), '#7ce6a3');
+        drawSimpleChart('cvdChart', payload.map(x => Number(x.cvd || 0)), '#ffd166');
+        document.getElementById('selectedMeta').textContent = select.options[select.selectedIndex].textContent;
+      }
+
+      select.addEventListener('change', e => loadChart(e.target.value));
+      if (symbolOptions.length) loadChart(symbolOptions[0].key);
+    }
+
+    main().catch(err => {
+      console.error(err);
+      document.body.insertAdjacentHTML('beforeend', '<div style="padding:20px;color:#ffb4a9">Falha ao carregar dashboard.</div>');
+    });
+  </script>
+</body>
+</html>
+"""

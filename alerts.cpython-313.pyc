@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import requests
+
+
+BINANCE_BASE = "https://fapi.binance.com"
+HL_BASE = "https://api.hyperliquid.xyz/info"
+
+
+class DataSourceError(RuntimeError):
+    pass
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in ("", None):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _request_json(
+    method: str,
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    timeout: int = 20,
+    headers: Optional[Dict[str, str]] = None,
+) -> Any:
+    response = requests.request(method, url, params=params, json=json, timeout=timeout, headers=headers)
+    if not response.ok:
+        raise DataSourceError(f"{method} {url} -> HTTP {response.status_code}: {response.text[:300]}")
+    return response.json()
+
+
+def binance_get(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    return _request_json("GET", BINANCE_BASE + endpoint, params=params)
+
+
+def get_klines_binance(symbol: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame:
+    data = binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore"
+        ],
+    )
+    if df.empty:
+        return df
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    num_cols = ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]
+    for col in num_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["trades"] = pd.to_numeric(df["trades"], errors="coerce").fillna(0).astype(int)
+    df = df.set_index("open_time").sort_index()
+    return df
+
+
+def get_agg_trades_binance(symbol: str, limit: int = 1000) -> pd.DataFrame:
+    data = binance_get("/fapi/v1/aggTrades", {"symbol": symbol, "limit": limit})
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["time"] = pd.to_datetime(df["T"], unit="ms", utc=True)
+    df["price"] = pd.to_numeric(df["p"], errors="coerce")
+    df["qty"] = pd.to_numeric(df["q"], errors="coerce")
+    df["value"] = df["price"] * df["qty"]
+    df["side"] = df["m"].apply(lambda x: "sell" if x else "buy")
+    return df[["time", "price", "qty", "value", "side"]].sort_values("time")
+
+
+def get_lsr_binance(symbol: str, period: str = "15m", limit: int = 100) -> pd.DataFrame:
+    data = binance_get(
+        "/futures/data/globalLongShortAccountRatio",
+        {"symbol": symbol, "period": period, "limit": limit},
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    for col in ["longShortRatio", "longAccount", "shortAccount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("timestamp")
+
+
+def get_taker_ratio_binance(symbol: str, period: str = "15m", limit: int = 100) -> pd.DataFrame:
+    data = binance_get(
+        "/futures/data/takerlongshortRatio",
+        {"symbol": symbol, "period": period, "limit": limit},
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    for col in ["buySellRatio", "buyVol", "sellVol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.sort_values("timestamp")
+
+
+def hl_post(payload: Dict[str, Any]) -> Any:
+    return _request_json(
+        "POST",
+        HL_BASE,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=25,
+    )
+
+
+def get_klines_hl(coin: str, interval: str = "15m", lookback: int = 200) -> pd.DataFrame:
+    interval_map = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800,
+        "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
+    }
+    secs = interval_map.get(interval, 900)
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - secs * lookback * 1000
+
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": interval,
+            "startTime": start_ms,
+            "endTime": end_ms,
+        },
+    }
+    data = hl_post(payload)
+    rows: List[Dict[str, Any]] = []
+    for c in data:
+        rows.append(
+            {
+                "open_time": pd.to_datetime(c["t"], unit="ms", utc=True),
+                "open": _safe_float(c["o"]),
+                "high": _safe_float(c["h"]),
+                "low": _safe_float(c["l"]),
+                "close": _safe_float(c["c"]),
+                "volume": _safe_float(c["v"]),
+                "trades": int(c.get("n", 0) or 0),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.set_index("open_time").sort_index()
+
+
+def get_hl_market_context(coin: str) -> Dict[str, float]:
+    data = hl_post({"type": "metaAndAssetCtxs"})
+    meta = data[0]["universe"]
+    ctxs = data[1]
+    for i, market in enumerate(meta):
+        if market["name"] == coin:
+            ctx = ctxs[i]
+            return {
+                "coin": coin,
+                "open_interest": _safe_float(ctx.get("openInterest", 0)),
+                "funding": _safe_float(ctx.get("funding", 0)),
+                "mark_price": _safe_float(ctx.get("markPx", 0)),
+                "mid_price": _safe_float(ctx.get("midPx", 0)),
+                "premium": _safe_float(ctx.get("premium", 0)),
+                "day_ntl_vlm": _safe_float(ctx.get("dayNtlVlm", 0)),
+                "oracle_price": _safe_float(ctx.get("oraclePx", 0)),
+            }
+    raise DataSourceError(f"Coin {coin} não encontrada na Hyperliquid universe.")
+
+
+def fetch_binance_bundle(symbol: str, interval: str = "15m", lookback: int = 200) -> Dict[str, Any]:
+    bundle: Dict[str, Any] = {"source": "binance", "symbol": symbol, "errors": []}
+    try:
+        bundle["klines"] = get_klines_binance(symbol, interval, lookback)
+    except Exception as exc:
+        bundle["klines"] = pd.DataFrame()
+        bundle["errors"].append(f"klines: {exc}")
+    try:
+        bundle["lsr"] = get_lsr_binance(symbol, interval, min(lookback, 100))
+    except Exception as exc:
+        bundle["lsr"] = pd.DataFrame()
+        bundle["errors"].append(f"lsr: {exc}")
+    try:
+        bundle["taker"] = get_taker_ratio_binance(symbol, interval, min(lookback, 100))
+    except Exception as exc:
+        bundle["taker"] = pd.DataFrame()
+        bundle["errors"].append(f"taker: {exc}")
+    try:
+        bundle["trades"] = get_agg_trades_binance(symbol, 1000)
+    except Exception as exc:
+        bundle["trades"] = pd.DataFrame()
+        bundle["errors"].append(f"aggTrades: {exc}")
+    return bundle
+
+
+def fetch_hl_bundle(coin: str, interval: str = "15m", lookback: int = 200) -> Dict[str, Any]:
+    bundle: Dict[str, Any] = {"source": "hyperliquid", "symbol": coin, "errors": []}
+    try:
+        bundle["klines"] = get_klines_hl(coin, interval, lookback)
+    except Exception as exc:
+        bundle["klines"] = pd.DataFrame()
+        bundle["errors"].append(f"klines: {exc}")
+    try:
+        bundle["klines_1m"] = get_klines_hl(coin, "1m", min(lookback * 3, 300))
+    except Exception as exc:
+        bundle["klines_1m"] = pd.DataFrame()
+        bundle["errors"].append(f"klines_1m: {exc}")
+    try:
+        bundle["market"] = get_hl_market_context(coin)
+    except Exception as exc:
+        bundle["market"] = {}
+        bundle["errors"].append(f"market: {exc}")
+    return bundle

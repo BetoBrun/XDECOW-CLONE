@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+
+SUPPORTED_OPERATORS = {">", ">=", "<", "<=", "==", "!=", "crossover_up", "crossover_down"}
+
+
+def load_rules(path: Path) -> List[Dict[str, Any]]:
+    rules = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rules, list):
+        raise ValueError("Arquivo de regras deve conter uma lista JSON.")
+    active_count = sum(1 for rule in rules if rule.get("active"))
+    if active_count > 10:
+        raise ValueError(f"Máximo de 10 alertas ativos. Encontrado: {active_count}")
+    seen_ids = set()
+    for rule in rules:
+        rid = rule.get("id")
+        if rid in seen_ids:
+            raise ValueError(f"ID de regra duplicado: {rid}")
+        seen_ids.add(rid)
+        op = rule.get("operator")
+        if op not in SUPPORTED_OPERATORS:
+            raise ValueError(f"Operador não suportado: {op}")
+    return rules
+
+
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"last_trigger_state": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_trigger_state": {}}
+
+
+def save_state(path: Path, state: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def compare_values(current: Any, operator: str, target: Any, previous: Any = None) -> bool:
+    if current is None:
+        return False
+    if operator == ">":
+        return current > target
+    if operator == ">=":
+        return current >= target
+    if operator == "<":
+        return current < target
+    if operator == "<=":
+        return current <= target
+    if operator == "==":
+        return current == target
+    if operator == "!=":
+        return current != target
+    if operator == "crossover_up":
+        return previous is not None and previous <= target and current > target
+    if operator == "crossover_down":
+        return previous is not None and previous >= target and current < target
+    return False
+
+
+def evaluate_rules(
+    rules: List[Dict[str, Any]],
+    snapshots: List[Dict[str, Any]],
+    *,
+    state: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    snapshot_map = {(s["source"], s["symbol"]): s for s in snapshots}
+    last_state = state.setdefault("last_trigger_state", {})
+    events: List[Dict[str, Any]] = []
+    triggered_now: List[Dict[str, Any]] = []
+
+    for rule in rules:
+        if not rule.get("active", False):
+            continue
+        key = (rule["source"], rule["symbol"])
+        snap = snapshot_map.get(key)
+        current = None if snap is None else snap.get(rule["metric"])
+        previous = None
+        matched = compare_values(current, rule["operator"], rule["value"], previous=previous)
+        state_key = str(rule["id"])
+        was_triggered = bool(last_state.get(state_key, False))
+        is_new = matched and not was_triggered
+        event = {
+            "rule_id": rule["id"],
+            "rule_name": rule["name"],
+            "source": rule["source"],
+            "symbol": rule["symbol"],
+            "metric": rule["metric"],
+            "operator": rule["operator"],
+            "target": rule["value"],
+            "current": current,
+            "triggered": matched,
+            "new_trigger": is_new,
+            "message": build_rule_message(rule, current, matched, is_new),
+            "timestamp": snap.get("timestamp") if snap else None,
+        }
+        events.append(event)
+        if is_new:
+            triggered_now.append(event)
+        last_state[state_key] = matched
+
+    return events, state, triggered_now
+
+
+def build_rule_message(rule: Dict[str, Any], current: Any, matched: bool, is_new: bool) -> str:
+    status = "DISPAROU" if is_new else ("ATIVO" if matched else "OK")
+    return (
+        f"[{status}] {rule['name']} | {rule['source']} {rule['symbol']} | "
+        f"{rule['metric']} {rule['operator']} {rule['value']} | atual={current}"
+    )
+
+
+def format_telegram_message(triggered: List[Dict[str, Any]]) -> str:
+    if not triggered:
+        return "Nenhum novo alerta Shark nesta rodada."
+    lines = ["🦈 Shark Alerts", ""]
+    for event in triggered[:10]:
+        lines.append(f"• {event['rule_name']}")
+        lines.append(f"  {event['source']} {event['symbol']} | {event['metric']}={event['current']}")
+    return "\n".join(lines)

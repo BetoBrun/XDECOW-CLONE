@@ -1,0 +1,4 @@
+{
+  "binance": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "hyperliquid": ["BTC", "ETH", "SOL"]
+}
